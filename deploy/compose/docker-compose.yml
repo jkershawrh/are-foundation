@@ -81,3 +81,66 @@ services:
       - "18085:8085"
       - "18086:8080"
       - "18090:8090"
+
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    profiles:
+      - kafka
+      - full
+
+  redpanda-console:
+    image: redpandadata/console:v2.7
+    environment:
+      KAFKA_BROKERS: kafka:9092
+    ports:
+      - "18088:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    profiles:
+      - kafka
+      - full
+
+  are-agent-registry:
+    build:
+      context: ../..
+      dockerfile: s0/agent-registry-service/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      ARE_DB_CONNECTION_STRING: postgres://are:are@postgres:5432/are?sslmode=disable
+      ARE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ARE_KAFKA_SASL_USERNAME: unused
+      ARE_KAFKA_SASL_PASSWORD: unused
+      ARE_KAFKA_TOPIC_LIFECYCLE: are.agents.lifecycle
+      ARE_GRPC_PORT: "9090"
+      ARE_HEALTH_PORT: "8080"
+      ARE_METRICS_PORT: "8081"
+    ports:
+      - "19090:9090"
+      - "19080:8080"
+      - "19081:8081"
+    profiles:
+      - kafka
+      - full

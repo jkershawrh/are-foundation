@@ -20,6 +20,8 @@ func matchPhase1Route(httpMethod string, path string) (routeSpec, bool) {
 		return routeSpec{Service: "ARE-A-S0-005", Method: "ListPassportsByAgent", SuccessStatus: 200}, true
 	case httpMethod == "POST" && path == "/v1/passports:verify":
 		return routeSpec{Service: "ARE-A-S0-005", Method: "VerifyPassport", SuccessStatus: 200}, true
+	case httpMethod == "POST" && path == "/v1/passports:revoke":
+		return routeSpec{Service: "ARE-A-S0-005", Method: "RevokePassport", SuccessStatus: 200}, true
 	case httpMethod == "POST" && path == "/v1/enforcement/scope:evaluate":
 		return routeSpec{Service: "ARE-A-S1-002", Method: "EvaluateScope", SuccessStatus: 200}, true
 	case httpMethod == "POST" && path == "/v1/policy/evaluations":
@@ -41,7 +43,7 @@ func requiresIdempotencyKey(httpMethod string, path string) bool {
 		return false
 	}
 	switch path {
-	case "/v1/identity/agents", "/v1/passports", "/v1/policy/evaluations", "/v1/enforcement/scope:evaluate", "/v1/passports:verify":
+	case "/v1/identity/agents", "/v1/passports", "/v1/policy/evaluations", "/v1/enforcement/scope:evaluate", "/v1/passports:verify", "/v1/passports:revoke":
 		return true
 	default:
 		return false

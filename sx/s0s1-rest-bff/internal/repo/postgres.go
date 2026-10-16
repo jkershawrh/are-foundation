@@ -54,8 +54,14 @@ func (p *Postgres) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS s0s1_passports (
 	passport_id TEXT PRIMARY KEY,
 	agent_id TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'ACTIVE',
 	response_body BYTEA NOT NULL
 )`,
+		`DO $$ BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_s0s1_passports_agent_active') THEN
+		CREATE UNIQUE INDEX idx_s0s1_passports_agent_active ON s0s1_passports(agent_id) WHERE status = 'ACTIVE';
+	END IF;
+END $$`,
 		`ALTER TABLE s0s1_agents ADD COLUMN IF NOT EXISTS admission_envelope_json JSONB`,
 	}
 	for _, s := range stmts {
@@ -230,7 +236,7 @@ ON CONFLICT (passport_id) DO UPDATE SET response_body = EXCLUDED.response_body`,
 }
 
 func (p *Postgres) ListPassportBodiesByAgent(ctx context.Context, agentID string) ([][]byte, error) {
-	rows, err := p.pool.Query(ctx, `SELECT response_body FROM s0s1_passports WHERE agent_id = $1 ORDER BY passport_id`, agentID)
+	rows, err := p.pool.Query(ctx, `SELECT response_body, status FROM s0s1_passports WHERE agent_id = $1 ORDER BY passport_id`, agentID)
 	if err != nil {
 		return nil, err
 	}
@@ -238,8 +244,18 @@ func (p *Postgres) ListPassportBodiesByAgent(ctx context.Context, agentID string
 	out := [][]byte{}
 	for rows.Next() {
 		var body []byte
-		if err := rows.Scan(&body); err != nil {
+		var status string
+		if err := rows.Scan(&body, &status); err != nil {
 			return nil, err
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(body, &parsed); err == nil {
+			if pp, ok := parsed["passport"].(map[string]any); ok {
+				pp["status"] = status
+				if updated, err := json.Marshal(parsed); err == nil {
+					body = updated
+				}
+			}
 		}
 		out = append(out, body)
 	}
@@ -248,12 +264,22 @@ func (p *Postgres) ListPassportBodiesByAgent(ctx context.Context, agentID string
 
 func (p *Postgres) GetPassportBody(ctx context.Context, passportID string) ([]byte, bool, error) {
 	var body []byte
-	err := p.pool.QueryRow(ctx, `SELECT response_body FROM s0s1_passports WHERE passport_id = $1`, passportID).Scan(&body)
+	var status string
+	err := p.pool.QueryRow(ctx, `SELECT response_body, status FROM s0s1_passports WHERE passport_id = $1`, passportID).Scan(&body, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if pp, ok := parsed["passport"].(map[string]any); ok {
+			pp["status"] = status
+			if updated, err := json.Marshal(parsed); err == nil {
+				return updated, true, nil
+			}
+		}
 	}
 	return body, true, nil
 }
@@ -278,4 +304,42 @@ func (p *Postgres) GetAdmissionEnvelope(ctx context.Context, agentID string) (ma
 		return nil, false, nil
 	}
 	return out, true, nil
+}
+
+func (p *Postgres) CheckAndRevokeActive(ctx context.Context, agentID string, force bool, reason string) (bool, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var one int
+	err = tx.QueryRow(ctx, `SELECT 1 FROM s0s1_passports WHERE agent_id = $1 AND status = 'ACTIVE' LIMIT 1 FOR UPDATE`, agentID).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_ = tx.Commit(ctx)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !force {
+		_ = tx.Commit(ctx)
+		return true, nil
+	}
+	_, err = tx.Exec(ctx, `UPDATE s0s1_passports SET status = 'REVOKED' WHERE agent_id = $1 AND status = 'ACTIVE'`, agentID)
+	if err != nil {
+		return false, err
+	}
+	return false, tx.Commit(ctx)
+}
+
+func (p *Postgres) RevokePassport(ctx context.Context, passportID, reason string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE s0s1_passports SET status = 'REVOKED' WHERE passport_id = $1 AND status = 'ACTIVE'`, passportID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAgentNotFound
+	}
+	return nil
 }

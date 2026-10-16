@@ -2,26 +2,29 @@ package repo
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 )
 
 // Memory is an in-process Repository (tests and no-database compose).
 type Memory struct {
-	mu           sync.Mutex
-	agents       map[string]AgentRec
-	registerIdem map[string][]byte
-	passportIdem map[string][]byte
-	passports    map[string][]byte
-	byAgent      map[string][]string
+	mu             sync.Mutex
+	agents         map[string]AgentRec
+	registerIdem   map[string][]byte
+	passportIdem   map[string][]byte
+	passports      map[string][]byte
+	byAgent        map[string][]string
+	passportStatus map[string]string // passport_id → "ACTIVE" | "REVOKED"
 }
 
 func NewMemory() *Memory {
 	return &Memory{
-		agents:       make(map[string]AgentRec),
-		registerIdem: make(map[string][]byte),
-		passportIdem: make(map[string][]byte),
-		passports:    make(map[string][]byte),
-		byAgent:      make(map[string][]string),
+		agents:         make(map[string]AgentRec),
+		registerIdem:   make(map[string][]byte),
+		passportIdem:   make(map[string][]byte),
+		passports:      make(map[string][]byte),
+		byAgent:        make(map[string][]string),
+		passportStatus: make(map[string]string),
 	}
 }
 
@@ -93,8 +96,62 @@ func (m *Memory) FinishPassport(_ context.Context, idemKey, agentID string, resp
 	if passportID := passportIDFromBody(responseBody); passportID != "" {
 		m.passports[passportID] = append([]byte(nil), responseBody...)
 		m.byAgent[agentID] = append(m.byAgent[agentID], passportID)
+		m.passportStatus[passportID] = "ACTIVE"
 	}
 	return append([]byte(nil), responseBody...), nil
+}
+
+func (m *Memory) CheckAndRevokeActive(_ context.Context, agentID string, force bool, reason string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hasActive := false
+	for _, pid := range m.byAgent[agentID] {
+		if m.passportStatus[pid] == "ACTIVE" {
+			hasActive = true
+			break
+		}
+	}
+	if !hasActive {
+		return false, nil
+	}
+	if !force {
+		return true, nil
+	}
+	for _, pid := range m.byAgent[agentID] {
+		if m.passportStatus[pid] == "ACTIVE" {
+			m.passportStatus[pid] = "REVOKED"
+			m.updatePassportStatusInBody(pid, "REVOKED")
+		}
+	}
+	return false, nil
+}
+
+func (m *Memory) RevokePassport(_ context.Context, passportID, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.passports[passportID]; !ok {
+		return ErrAgentNotFound
+	}
+	m.passportStatus[passportID] = "REVOKED"
+	m.updatePassportStatusInBody(passportID, "REVOKED")
+	return nil
+}
+
+func (m *Memory) updatePassportStatusInBody(passportID, status string) {
+	body, ok := m.passports[passportID]
+	if !ok {
+		return
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return
+	}
+	if pp, ok := parsed["passport"].(map[string]any); ok {
+		pp["status"] = status
+		if updated, err := json.Marshal(parsed); err == nil {
+			m.passports[passportID] = updated
+		}
+	}
 }
 
 func (m *Memory) ListPassportBodiesByAgent(_ context.Context, agentID string) ([][]byte, error) {

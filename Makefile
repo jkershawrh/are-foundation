@@ -1,6 +1,6 @@
-.PHONY: certs up down smoke pressure pressure-matrix test gate secret-scan release-audit clean
+.PHONY: certs up down smoke pressure pressure-matrix passport-deep oberon test gate secret-scan release-audit clean
 
-COMPOSE=docker compose -f deploy/compose/docker-compose.yml
+COMPOSE=podman compose -f deploy/compose/docker-compose.yml
 
 certs:
 	python tools/gates/generate_dev_certs.py
@@ -19,6 +19,15 @@ pressure:
 
 pressure-matrix:
 	python tools/smoke/foundation_pressure_matrix.py
+
+passport-deep:
+	python tools/smoke/passport_deep_test.py
+
+oberon:
+	bash tools/smoke/oberon_deploy_test.sh
+
+oberon-full:
+	bash tools/smoke/oberon_deploy_test.sh --profile full
 
 test:
 	cd tools/testing/policyfixtures && go test ./...

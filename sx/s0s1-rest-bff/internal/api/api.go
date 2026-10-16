@@ -86,6 +86,9 @@ func Handler(cfg Config) (http.Handler, error) {
 	mux.HandleFunc("POST /v1/passports:verify", func(w http.ResponseWriter, r *http.Request) {
 		verifyPassport(w, r, &cfg)
 	})
+	mux.HandleFunc("POST /v1/passports:revoke", func(w http.ResponseWriter, r *http.Request) {
+		revokePassport(w, r, &cfg)
+	})
 	mux.HandleFunc("POST /v1/enforcement/scope:evaluate", func(w http.ResponseWriter, r *http.Request) {
 		evaluateScope(w, r, &cfg)
 	})
@@ -413,6 +416,47 @@ func issuePassport(w http.ResponseWriter, r *http.Request, cfg *Config) {
 		scopeRows = append(scopeRows, row)
 	}
 
+	// --- Passport governance validation (local fallback mirrors S0 engine rules) ---
+
+	normalType := strings.ToUpper(strings.TrimSpace(passportType))
+	if normalType != "STANDARD" && normalType != "PROVISIONAL" {
+		jsonError(w, rid, "INVALID_ARGUMENT", "passport_type must be STANDARD or PROVISIONAL", false, http.StatusBadRequest)
+		return
+	}
+
+	const ttlMin int64 = 300
+	const ttlMaxProvisional int64 = 86400
+	const ttlMaxStandard int64 = 2592000
+	if ttl < ttlMin {
+		jsonError(w, rid, "INVALID_ARGUMENT", fmt.Sprintf("ttl_seconds must be >= %d", ttlMin), false, http.StatusBadRequest)
+		return
+	}
+	if normalType == "PROVISIONAL" && ttl > ttlMaxProvisional {
+		jsonError(w, rid, "INVALID_ARGUMENT", fmt.Sprintf("provisional ttl_seconds must be <= %d", ttlMaxProvisional), false, http.StatusBadRequest)
+		return
+	}
+	if normalType == "STANDARD" && ttl > ttlMaxStandard {
+		jsonError(w, rid, "INVALID_ARGUMENT", fmt.Sprintf("standard ttl_seconds must be <= %d", ttlMaxStandard), false, http.StatusBadRequest)
+		return
+	}
+
+	provisionalAllowed := map[string]bool{"READ": true, "NOTIFY": true, "QUERY": true}
+	if normalType == "PROVISIONAL" {
+		for _, row := range scopeRows {
+			ac, _ := row["action_class"].(string)
+			acNorm := strings.ToUpper(strings.TrimSpace(ac))
+			if dot := strings.LastIndex(acNorm, "."); dot >= 0 {
+				acNorm = acNorm[dot+1:]
+			}
+			if !provisionalAllowed[acNorm] {
+				jsonError(w, rid, "INVALID_ARGUMENT",
+					fmt.Sprintf("provisional passports only allow READ, NOTIFY, QUERY action classes; got %q", ac),
+					false, http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
 	found, err := existsAgentForPassport(ctx, cfg, rp, agentID)
 	if err != nil {
 		jsonError(w, rid, "INTERNAL", "storage error", false, http.StatusInternalServerError)
@@ -423,8 +467,24 @@ func issuePassport(w http.ResponseWriter, r *http.Request, cfg *Config) {
 		return
 	}
 
+	forceReissue, _ := payload["force"].(bool)
+	if !forceReissue {
+		if fr2, ok := payload["force_reissue"].(bool); ok {
+			forceReissue = fr2
+		}
+	}
+
+	conflict, err := rp.CheckAndRevokeActive(ctx, agentID, forceReissue, "superseded_by_force_reissue")
+	if err != nil {
+		jsonError(w, rid, "INTERNAL", "storage error", false, http.StatusInternalServerError)
+		return
+	}
+	if conflict {
+		jsonError(w, rid, "ALREADY_EXISTS", "agent already has an active passport; use force=true to supersede", false, http.StatusConflict)
+		return
+	}
+
 	if cfg.S0 != nil && cfg.S0.Pass != nil {
-		forceReissue, _ := payload["force_reissue"].(bool)
 		pReq := s0delegate.BuildIssueRequest(agentID, passportType, issuedBy, reason, ttl, scopeRows, forceReissue)
 		body, err := s0delegate.IssuePassportJSON(ctx, cfg.S0.Pass, pReq)
 		if err != nil {
@@ -446,6 +506,9 @@ func issuePassport(w http.ResponseWriter, r *http.Request, cfg *Config) {
 		return
 	}
 
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Duration(ttl) * time.Second)
+
 	scopeSet := make([]map[string]any, 0, len(scopeRows))
 	for i, row := range scopeRows {
 		ac, _ := row["action_class"].(string)
@@ -462,10 +525,13 @@ func issuePassport(w http.ResponseWriter, r *http.Request, cfg *Config) {
 		"passport": map[string]any{
 			"passport_id":   passportID,
 			"agent_id":      agentID,
-			"passport_type": passportType,
+			"passport_type": normalType,
 			"scope_set":     scopeSet,
 			"status":        "ACTIVE",
 			"issued_by":     issuedBy,
+			"issued_at":     now.Format(time.RFC3339),
+			"expires_at":    expiresAt.Format(time.RFC3339),
+			"ttl_seconds":   ttl,
 		},
 	}
 	body, err := json.Marshal(bodyMap)
@@ -486,6 +552,42 @@ func issuePassport(w http.ResponseWriter, r *http.Request, cfg *Config) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_, _ = w.Write(out)
+}
+
+func revokePassport(w http.ResponseWriter, r *http.Request, cfg *Config) {
+	rid := requestID(r)
+	rp := cfg.Repo
+	idem := r.Header.Get("Idempotency-Key")
+	if idem == "" {
+		jsonError(w, rid, "MISSING_IDEMPOTENCY_KEY", "idempotency key required", false, http.StatusBadRequest)
+		return
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		jsonError(w, rid, "INVALID_ARGUMENT", "invalid json body", false, http.StatusBadRequest)
+		return
+	}
+	passportID, _ := payload["passport_id"].(string)
+	reason, _ := payload["reason"].(string)
+	if strings.TrimSpace(passportID) == "" || strings.TrimSpace(reason) == "" {
+		jsonError(w, rid, "INVALID_ARGUMENT", "passport_id and reason are required", false, http.StatusBadRequest)
+		return
+	}
+	if err := rp.RevokePassport(r.Context(), passportID, reason); err != nil {
+		if errors.Is(err, repo.ErrAgentNotFound) {
+			jsonError(w, rid, "NOT_FOUND", "passport not found or already revoked", false, http.StatusNotFound)
+			return
+		}
+		jsonError(w, rid, "INTERNAL", "revocation failed", false, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"revoked":     true,
+		"passport_id": passportID,
+		"reason":      reason,
+	})
 }
 
 func listPassportsByAgent(w http.ResponseWriter, r *http.Request, cfg *Config) {
